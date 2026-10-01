@@ -1,0 +1,75 @@
+# 发布 Release 后自动构建六平台二进制并上传到该 Release。
+# Trigger: 在 GitHub 上发布(或编辑重发)一个 Release,或手动 workflow_dispatch。
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要上传二进制的 Release tag(例如 v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    name: build & upload binaries
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Cross-compile all platforms
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          COMMIT="${GITHUB_SHA::7}"
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${DATE}"
+          mkdir -p dist
+          TARGETS=(
+            "linux/amd64"
+            "linux/arm64"
+            "darwin/amd64"
+            "darwin/arm64"
+            "windows/amd64"
+            "windows/arm64"
+          )
+          for target in "${TARGETS[@]}"; do
+            GOOS="${target%%/*}"
+            GOARCH="${target##*/}"
+            NAME="skydroid-onvif-adapter_${GOOS}_${GOARCH}"
+            echo "==> building ${NAME}"
+            CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
+              go build -trimpath -ldflags "${LDFLAGS}" -o "dist/${NAME}/skydroid-onvif-adapter" ./cmd/skydroid-onvif-adapter
+            cp LICENSE README.md "dist/${NAME}/"
+            if [ "${GOOS}" = "windows" ]; then
+              (cd "dist/${NAME}" && zip -r "../${NAME}.zip" .)
+            else
+              (cd "dist/${NAME}" && tar -czf "../${NAME}.tar.gz" .)
+            fi
+            rm -rf "dist/${NAME}"
+          done
+
+      - name: Checksums
+        run: |
+          cd dist
+          shasum -a 256 *.tar.gz *.zip > checksums.txt
+
+      - name: Upload assets to the Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "上传以下资产到 Release ${TAG}:"
+          ls -lh dist/
+          gh release upload "${TAG}" dist/*.tar.gz dist/*.zip dist/checksums.txt --clobber
