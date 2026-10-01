@@ -130,9 +130,23 @@ Stop、预置位生命周期、内建模式位、Home、未知操作 Fault、设
 - Go 1.24+
 - ffmpeg（仅快照功能；无 ffmpeg 时其余功能不受影响）
 
+## Docker 运行
+
+镜像随 Release 发布到 GHCR（linux/amd64 + linux/arm64）：
+
+```bash
+docker run --rm --network host \
+  ghcr.io/linuxsuren/skydroid-onvif-adapter:latest \
+  --camera-ip 192.168.144.108
+```
+
+host 网络用于 WS-Discovery 组播与云台姿态 UDP 上报；镜像内置 ffmpeg（快照抓帧）。
+
 ## 发布与 CI
 
 - push master / PR 自动触发 `build` workflow（go vet + go test -race）
-- 发布：打 tag 并创建 GitHub Release，`release` workflow 自动构建六平台
-  （linux/darwin/windows × amd64/arm64）tar.gz/zip + checksums 并上传
-- 本地验证发布产物：`make snapshot`（需要 [goreleaser](https://goreleaser.com)）
+- 发布：打 tag 并创建 GitHub Release，`release` workflow 自动产出：
+  - **二进制**：六平台（linux/darwin/windows × amd64/arm64）tar.gz/zip + checksums
+  - **镜像**：`ghcr.io/linuxsuren/skydroid-onvif-adapter:{版本,latest}`（多架构）
+- 本地验证发布产物：`make snapshot`（需要 [goreleaser](https://goreleaser.com)）；
+  本地构建镜像：`make image`
