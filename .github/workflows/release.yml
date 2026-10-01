@@ -1,4 +1,5 @@
-# 发布 Release 后自动构建六平台二进制并上传到该 Release。
+# 发布 Release 后自动构建六平台二进制并上传到该 Release，
+# 同时构建多架构容器镜像推送 GHCR。
 # Trigger: 在 GitHub 上发布(或编辑重发)一个 Release,或手动 workflow_dispatch。
 name: release
 
@@ -13,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   binaries:
@@ -73,3 +75,47 @@ jobs:
           echo "上传以下资产到 Release ${TAG}:"
           ls -lh dist/
           gh release upload "${TAG}" dist/*.tar.gz dist/*.zip dist/checksums.txt --clobber
+
+  image:
+    name: build & push container image
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          # GHCR 要求镜像路径全小写。
+          REPO_LOWER="$(echo "${GITHUB_REPOSITORY}" | tr 'A-Z' 'a-z')"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${REPO_LOWER}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ github.sha }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

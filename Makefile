@@ -30,6 +30,9 @@ release: ## 通过 goreleaser 发布（tag 触发，需 goreleaser 与 GITHUB_TO
 snapshot: ## 本地验证发布产物（不打 tag、不上传）
 	goreleaser build --snapshot --clean
 
+image: ## 本地构建容器镜像
+	docker build -t skydroid-onvif-adapter:dev .
+
 run: build ## 本地运行
 	$(BINARY)
 
