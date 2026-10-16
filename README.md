@@ -31,6 +31,11 @@ make build
 
 # 2. 启动适配器
 ./bin/skydroid-onvif-adapter --camera-ip 192.168.144.108
+
+# 3. 双光机型（可见光/红外分属不同 RTSP 端口）显式指定每路码流地址：
+./bin/skydroid-onvif-adapter --camera-ip 192.168.1.108 \
+  --rtsp-main rtsp://192.168.1.108:554/stream=1 \
+  --rtsp-sub  rtsp://192.168.1.108:555/stream=2 --sub-name 红外
 ```
 
 ## 架构与协议映射
@@ -81,6 +86,10 @@ ONVIF 客户端 ──SOAP──▶ 适配器(:8080) ──TP/UDP 9002──▶ 
 | `--camera-udp-port` | `CAMERA_UDP_PORT` | `5000` | TP 命令 UDP 端口（官方 C10Pro 默认） |
 | `--camera-tcp-port` | `CAMERA_TCP_PORT` | `8100` | TCP 端口（官方 C20 相机默认 8100，云台 5000） |
 | `--rtsp-base` | `CAMERA_RTSP_BASE` | `<camera-ip>:554` | RTSP 基址 |
+| `--rtsp-main` | `CAMERA_RTSP_MAIN` | 按基址拼接 | profile_main 显式 RTSP 地址（如 `rtsp://192.168.1.108:554/stream=1`），适配码流路径/端口非默认的机型 |
+| `--rtsp-sub` | `CAMERA_RTSP_SUB` | 按基址拼接 | profile_sub 显式 RTSP 地址（如 `rtsp://192.168.1.108:555/stream=2`） |
+| `--main-name` | `CAMERA_MAIN_NAME` | `主码流` | profile_main 名称后缀 |
+| `--sub-name` | `CAMERA_SUB_NAME` | `子码流` | profile_sub 名称后缀（红外通道建议填「红外」，便于客户端按名称识别） |
 | `--http-addr` | `HTTP_ADDR` | `:8080` | HTTP 监听（端口被占自动向后漂移） |
 | `--advertise-ip` | `ADVERTISE_IP` | 自动探测 | 对外宣告 IP |
 | `--model` | `CAMERA_MODEL` | `C20` | ONVIF Model |
