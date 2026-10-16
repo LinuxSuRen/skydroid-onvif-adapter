@@ -322,3 +322,167 @@ func freeTCPPortForUDP(t *testing.T) int {
 	_ = ln.Close()
 	return port
 }
+
+// --- UDP 查询（issue #3：固件版本查询失败时回退 UDP 通道） ---
+
+// realVERResponse 真机（UDP-only 机型）经 5000/UDP 查询固件版本的应答原文。
+const realVERResponse = "#tpDU3rVER01050860"
+
+// TestVERResponseChecksum 实测应答帧的校验结论：末 2 位 "60" 恰好等于去掉末 2 位
+// 后整帧（含 '#'）全部 ASCII 字节的累加校验（Checksum("#tpDU3rVER010508") == "60"），
+// 与 GAC 姿态上报帧（#tp*GAC...<crc2>）一致——即 VER 应答帧带 2 位尾校验。
+// 因此解析时校验并剥离末 2 位再取版本号：真机应答的版本数据实为 "0508"
+// （固件 05.08；把校验位 "60" 一并读成 "050860"/05.08.60 属于误读）。
+func TestVERResponseChecksum(t *testing.T) {
+	if cs := Checksum(realVERResponse[:len(realVERResponse)-2]); cs != realVERResponse[len(realVERResponse)-2:] {
+		t.Fatalf("Checksum(%q) = %s, trailing = %s（不吻合：应答不带校验，应改为不剥离解析）",
+			realVERResponse[:len(realVERResponse)-2], cs, realVERResponse[len(realVERResponse)-2:])
+	}
+	// 结论吻合：真机应答解析出的版本数据为 "0508"。
+	if got := ParseVERResponse(realVERResponse); got != "0508" {
+		t.Fatalf("ParseVERResponse(real) = %q, want 0508", got)
+	}
+}
+
+// TestParseVERResponse 按「末 2 位校验吻合则剥离」规则解析各类应答帧。
+func TestParseVERResponse(t *testing.T) {
+	// 按校验结论构造的、版本数据为 "050860" 的正确帧（末 2 位为整帧累加校验）。
+	base := "#tpDU3rVER01" + "050860"
+	cases := []struct{ resp, want string }{
+		{realVERResponse, "0508"},         // 真机原文：末 2 位 "60" 是校验
+		{base + Checksum(base), "050860"}, // 版本 050860 + 正确校验
+		{"#tpDU3rVER01ABCD", "ABCD"},      // 末 2 位非有效校验（Checksum(...)=59≠CD）：不剥离
+		{"#tpDU3rVER01", ""},              // 无版本数据
+		{"garbage", ""},                   // 非应答帧
+		{"#tpUG2rGAC000000000000AA", ""},  // GAC 姿态帧不含版本
+	}
+	for _, c := range cases {
+		if got := ParseVERResponse(c.resp); got != c.want {
+			t.Fatalf("ParseVERResponse(%q) = %q, want %q", c.resp, got, c.want)
+		}
+	}
+}
+
+// fakeUDPCamera 最小假相机：把收到的包写入 commands，再按 replies 顺序回包
+//（replies 为空即只收不应答）。
+type fakeUDPCamera struct {
+	addr     string
+	commands chan string
+}
+
+func startFakeUDPCamera(t *testing.T, replies ...string) *fakeUDPCamera {
+	t.Helper()
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc := &fakeUDPCamera{
+		addr:     conn.LocalAddr().String(),
+		commands: make(chan string, 64),
+	}
+	go func() {
+		buf := make([]byte, 256)
+		for {
+			n, from, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			select {
+			case fc.commands <- string(buf[:n]):
+			default:
+			}
+			for _, r := range replies {
+				_, _ = conn.WriteToUDP([]byte(r), from)
+			}
+		}
+	}()
+	t.Cleanup(func() { _ = conn.Close() })
+	return fc
+}
+
+// TestQueryUDPVersion 假相机对收到的包先回 GAC 姿态帧、再回带正确校验的 VER 应答：
+// QueryUDP 应拿到版本应答（与 readLoop 共存、不抢包），解析出版本号 "050860"，
+// 且 readLoop 的姿态解析不受影响。
+func TestQueryUDPVersion(t *testing.T) {
+	base := "#tpDU3rVER01" + "050860"
+	verFrame := base + Checksum(base) // "#tpDU3rVER01050860C6"
+	fc := startFakeUDPCamera(t,
+		"#tpUG2rGAC"+AngleToHex(12.5)+AngleToHex(-30)+AngleToHex(0)+"AA",
+		verFrame)
+	c, err := NewClient(TransportUDP, fc.addr, "127.0.0.1:19055", 0, quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	resp, err := c.QueryUDP(CmdGetVersion, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp != verFrame {
+		t.Fatalf("resp = %q, want %q", resp, verFrame)
+	}
+	if got := ParseVERResponse(resp); got != "050860" {
+		t.Fatalf("version = %q, want 050860", got)
+	}
+	// 命令必须自动追加校验后发送。
+	select {
+	case got := <-fc.commands:
+		if got != Frame(CmdGetVersion) {
+			t.Fatalf("cmd = %q, want %q", got, Frame(CmdGetVersion))
+		}
+	default:
+		t.Fatal("no command received")
+	}
+	// 同一 socket 上 readLoop 的姿态解析照常工作（GAC 帧不满足 VER waiter）。
+	deadline := time.After(3 * time.Second)
+	for {
+		if _, _, _, fresh := c.Attitude(2 * time.Second); fresh {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("attitude not received alongside udp query")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// TestQueryUDPTimeout 假相机只收不应答时，QueryUDP 按传入的小超时（按尝试次数
+// 均分后逐次等待并重发）在时限内返回错误，无需额外可调参数。
+func TestQueryUDPTimeout(t *testing.T) {
+	fc := startFakeUDPCamera(t) // 不回任何包
+	c, err := NewClient(TransportUDP, fc.addr, "127.0.0.1:19055", 0, quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	start := time.Now()
+	if _, err := c.QueryUDP(CmdGetVersion, 450*time.Millisecond); err == nil {
+		t.Fatal("want error for udp query timeout")
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("timeout took too long: %v", d)
+	}
+	// 超时窗口内应完成全部重发尝试（默认 3 次）。
+	for i := 0; i < 3; i++ {
+		select {
+		case <-fc.commands:
+		case <-time.After(time.Second):
+			t.Fatalf("attempt %d not received", i+1)
+		}
+	}
+}
+
+// TestQueryUDPRequiresUDPTransport TCP 模式客户端没有 UDP 连接，QueryUDP 直接报错。
+func TestQueryUDPRequiresUDPTransport(t *testing.T) {
+	c, err := NewClient(TransportTCP, "127.0.0.1:19002", "127.0.0.1:19055", 0, quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+	if _, err := c.QueryUDP(CmdGetVersion, time.Second); err == nil {
+		t.Fatal("want error without udp transport")
+	}
+}
