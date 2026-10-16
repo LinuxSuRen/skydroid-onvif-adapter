@@ -71,6 +71,10 @@ ONVIF 客户端 ──SOAP──▶ 适配器(:8080) ──TP/UDP 9002──▶ 
 - UDP 命令无 ACK，适配器按 3 次重发（间隔 30ms）提高可靠性
 - 俯仰上限 30°、下限 −90° 为协议约束
 - 部分命令来自 APK 逆向，未经全部真机验证
+- 部分机型（实测 rtsp_demo 固件）每路流仅允许单个并发 RTSP 会话：主码流 stream=0 被
+  其它客户端占用时，新客户端 DESCRIBE 报 454，现象为拉流失败但相机在线；可改用子码流
+  profile_sub（stream=1）替代，或用 mediamtx 做中继多客户端分发、`--rtsp-base` 指向
+  中继地址
 
 ## 运行参数
 
@@ -93,7 +97,8 @@ ONVIF 客户端 ──SOAP──▶ 适配器(:8080) ──TP/UDP 9002──▶ 
 
 1. `ping 192.168.144.108` —— 网络可达
 2. `./skydroid-onvif-adapter --probe` —— TCP 查询返回固件号、UDP 发送成功
-3. `ffplay rtsp://192.168.144.108:554/stream=0` —— 视频链路
+3. `ffplay rtsp://192.168.144.108:554/stream=0` —— 视频链路；若报 454，
+   通常是该路流已被其它客户端占用（单会话限制），换子码流 `stream=1` 验证
 4. 启动适配器后用 ONVIF Device Manager（或任意 ONVIF 客户端）发现/手动添加，
    云台方向键、预置位（token 1-6 为内建位）、抓拍逐一验证
 5. `curl http://<ip>:8080/onvif/snapshot/profile_sub` —— 快照出图
