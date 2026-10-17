@@ -47,6 +47,10 @@ func main() {
 		model           = flag.String("model", envOr("CAMERA_MODEL", "C20"), "ONVIF Model 字段")
 		serial          = flag.String("serial", envOr("CAMERA_SERIAL", ""), "ONVIF SerialNumber 字段，默认自动生成")
 		rtspBase        = flag.String("rtsp-base", envOr("CAMERA_RTSP_BASE", ""), "相机 RTSP 基址（ip:port），默认 <camera-ip>:554")
+		rtspMain        = flag.String("rtsp-main", envOr("CAMERA_RTSP_MAIN", ""), "profile_main 显式 RTSP 地址（如 rtsp://192.168.1.108:554/stream=1），留空按 --rtsp-base/stream=0 拼接")
+		rtspSub         = flag.String("rtsp-sub", envOr("CAMERA_RTSP_SUB", ""), "profile_sub 显式 RTSP 地址（如 rtsp://192.168.1.108:555/stream=2），留空按 --rtsp-base/stream=1 拼接")
+		mainName        = flag.String("main-name", envOr("CAMERA_MAIN_NAME", "主码流"), "profile_main 名称后缀")
+		subName         = flag.String("sub-name", envOr("CAMERA_SUB_NAME", "子码流"), "profile_sub 名称后缀（红外通道建议填「红外」，便于客户端按名称识别）")
 		ffmpegBin       = flag.String("ffmpeg-bin", envOr("FFMPEG_BIN", "ffmpeg"), "ffmpeg 路径（快照抓帧用）")
 		discoveryOn     = flag.Bool("discovery", envBool("DISCOVERY", true), "是否开启 WS-Discovery")
 		logLevel        = flag.String("log-level", envOr("LOG_LEVEL", "info"), "日志级别 debug|info|warn|error")
@@ -108,8 +112,8 @@ func main() {
 		HTTPPort:       httpPort,
 		CameraRTSPBase: *rtspBase,
 		Profiles: []onvif.Profile{
-			{Token: "profile_main", Name: *cameraName + " 主码流", StreamIndex: 0, Width: 1920, Height: 1080, Framerate: 30},
-			{Token: "profile_sub", Name: *cameraName + " 子码流", StreamIndex: 1, Width: 640, Height: 360, Framerate: 15},
+			{Token: "profile_main", Name: *cameraName + " " + *mainName, StreamIndex: 0, RTSPURL: *rtspMain, Width: 1920, Height: 1080, Framerate: 30},
+			{Token: "profile_sub", Name: *cameraName + " " + *subName, StreamIndex: 1, RTSPURL: *rtspSub, Width: 640, Height: 360, Framerate: 15},
 		},
 	}
 
@@ -130,7 +134,8 @@ func main() {
 			http.NotFound(w, r)
 			return
 		}
-		data, err := snaps.JPEG(fmt.Sprintf("rtsp://%s/stream=%d", cfg.CameraRTSPBase, p.StreamIndex))
+		// 快照按 profile 实际码流地址取流（设置显式 RTSPURL 的 profile 同样支持，如红外）。
+		data, err := snaps.JPEG(cfg.StreamURI(p))
 		if err != nil {
 			logger.Warn("snapshot failed", "err", err.Error())
 			http.Error(w, "snapshot failed: "+err.Error(), http.StatusBadGateway)
@@ -151,7 +156,7 @@ func main() {
 			"version":        version,
 			"camera_ip":      *cameraIP,
 			"onvif_endpoint": cfg.XAddr(),
-			"stream_uri":     fmt.Sprintf("rtsp://%s/stream=0", cfg.CameraRTSPBase),
+			"stream_uri":     cfg.StreamURI(cfg.Profiles[0]),
 			"firmware":       firmware,
 		})
 	})

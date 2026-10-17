@@ -14,7 +14,8 @@ import (
 type Profile struct {
 	Token       string `json:"token"`        // 如 profile_main
 	Name        string `json:"name"`         // 如 主码流
-	StreamIndex int    `json:"stream_index"` // rtsp://<cam>/stream=N
+	StreamIndex int    `json:"stream_index"` // RTSPURL 为空时按 rtsp://<base>/stream=N 拼接
+	RTSPURL     string `json:"rtsp_url"`     // 显式码流地址（如 rtsp://ip:555/stream=2），设置后优先于拼接
 	Width       int    `json:"width"`
 	Height      int    `json:"height"`
 	Framerate   int    `json:"framerate"`
@@ -40,7 +41,12 @@ func (c Config) XAddr() string {
 }
 
 // StreamURI 返回指定 profile 对应的相机 RTSP 地址（客户端直连相机拉流）。
+// Profile 设置了显式 RTSPURL 时直接返回（适配 554/stream=1 + 555/stream=2 这类
+// 码流分散在多端口的机型），否则按基址 + 码流序号拼接。
 func (c Config) StreamURI(p Profile) string {
+	if p.RTSPURL != "" {
+		return p.RTSPURL
+	}
 	return fmt.Sprintf("rtsp://%s/stream=%d", c.CameraRTSPBase, p.StreamIndex)
 }
 

@@ -107,7 +107,8 @@ type testRig struct {
 	ts  *httptest.Server
 }
 
-func newRig(t *testing.T) *testRig {
+// newRig 搭建测试脚手架；profiles 非空时覆盖默认的双 profile 配置。
+func newRig(t *testing.T, profiles ...Profile) *testRig {
 	t.Helper()
 	cam := startFakeCam(t)
 	client, err := skydroid.NewClient(skydroid.TransportUDP, cam.addr(cam.udpPort), cam.addr(cam.tcpPort), 0,
@@ -127,6 +128,9 @@ func newRig(t *testing.T) *testRig {
 		AdvertiseIP:    "192.0.2.10",
 		HTTPPort:       8080,
 		CameraRTSPBase: "192.168.144.108:554",
+	}
+	if len(profiles) > 0 {
+		cfg.Profiles = profiles
 	}
 	svc := NewService(cfg, driver, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ts := httptest.NewServer(svc.Handler())
@@ -208,6 +212,45 @@ func TestE2EDeviceInfoAndStreams(t *testing.T) {
 		`<trt:ProfileToken>profile_main</trt:ProfileToken>`)
 	if err := xml.Unmarshal([]byte(body), &snap); err != nil || snap.MediaURI.URI != "http://192.0.2.10:8080/onvif/snapshot/profile_main" {
 		t.Fatalf("snapshot uri: %v %s", err, body)
+	}
+}
+
+// TestE2EExplicitStreamURL 验证 Profile 设置显式 RTSPURL 时 GetStreamUri 返回该地址
+// （适配码流分散在多端口的机型：可见光 554/stream=1、红外 555/stream=2），
+// 且不设置时保持按基址拼接的默认行为。
+func TestE2EExplicitStreamURL(t *testing.T) {
+	rig := newRig(t,
+		Profile{Token: "profile_main", Name: "可见光", StreamIndex: 0,
+			RTSPURL: "rtsp://192.168.1.108:554/stream=1", Width: 1280, Height: 720, Framerate: 30},
+		Profile{Token: "profile_sub", Name: "红外", StreamIndex: 1,
+			RTSPURL: "rtsp://192.168.1.108:555/stream=2", Width: 384, Height: 288, Framerate: 25},
+	)
+
+	type mediaURIResp struct {
+		MediaURI struct {
+			URI string `xml:"Uri"`
+		} `xml:"MediaUri"`
+	}
+	cases := []struct{ token, want string }{
+		{"profile_main", "rtsp://192.168.1.108:554/stream=1"},
+		{"profile_sub", "rtsp://192.168.1.108:555/stream=2"},
+	}
+	for _, c := range cases {
+		body := op(t, rig, "trt", "GetStreamUri", nsMedia,
+			`<trt:ProfileToken>`+c.token+`</trt:ProfileToken>`)
+		var stream mediaURIResp
+		if err := xml.Unmarshal([]byte(body), &stream); err != nil || stream.MediaURI.URI != c.want {
+			t.Fatalf("%s stream uri: %v %s", c.token, err, body)
+		}
+	}
+
+	// 默认行为回归：未设置显式地址的 profile 仍按基址 + 序号拼接。
+	def := newRig(t, Profile{Token: "profile_main", Name: "主码流", StreamIndex: 0, Width: 1920, Height: 1080, Framerate: 30})
+	body := op(t, def, "trt", "GetStreamUri", nsMedia,
+		`<trt:ProfileToken>profile_main</trt:ProfileToken>`)
+	var stream mediaURIResp
+	if err := xml.Unmarshal([]byte(body), &stream); err != nil || stream.MediaURI.URI != "rtsp://192.168.144.108:554/stream=0" {
+		t.Fatalf("default stream uri: %v %s", err, body)
 	}
 }
 
