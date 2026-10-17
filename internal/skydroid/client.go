@@ -83,6 +83,12 @@ type Client struct {
 	attRoll  float64
 	attAt    time.Time
 	attValid bool
+
+	// UDP 查询等待机制（issue #3）：QueryUDP 注册 waiter 后发送命令，
+	// readLoop/handleFrame 收到查询应答帧（含 "VER" 且非 GAC）时投递给 waiter；
+	// 无 waiter 时投递是空操作，readLoop 行为与原来完全一致。
+	queryMu     sync.Mutex
+	queryWaiter chan string
 }
 
 // NewClient 创建客户端。udpAddr/tcpAddr 形如 192.168.144.108:5000。
@@ -128,7 +134,9 @@ func NewClient(transport Transport, udpAddr, tcpAddr string, listenUDPPort int, 
 	return c, nil
 }
 
-// readLoop 接收云台上报帧，解析姿态（#tp*GAC<yaw4><pitch4><roll4><crc2>）。
+// readLoop 是 udpConn 上唯一的读取方：消费全部入站帧——GAC 姿态帧更新姿态，
+// 查询应答帧投递给挂起的 waiter（handleFrame 分发）。UDP 查询不得另开并发读
+// 同一 socket，否则会与 readLoop 互相抢包。
 func (c *Client) readLoop() {
 	buf := make([]byte, 512)
 	for {
@@ -140,26 +148,51 @@ func (c *Client) readLoop() {
 	}
 }
 
+// handleFrame 分发 readLoop 收到的帧：
+//   - GAC 姿态上报帧（#tp*GAC<yaw4><pitch4><roll4><crc2>）→ 更新姿态缓存；
+//   - 其余含 "VER" 的查询应答帧（如 #tpDU3rVER01<版本><校验>）→ 投递给挂起的
+//     UDP 查询 waiter（见 QueryUDP）；无 waiter 时忽略，行为与原来一致。
 func (c *Client) handleFrame(frame string) {
 	if len(frame) < 4 || frame[0] != '#' || (frame[1] != 't' && frame[1] != 'T') {
 		return
 	}
-	idx := strings.Index(frame, "GAC")
-	if idx < 0 || len(frame) < idx+3+12 {
+	if idx := strings.Index(frame, "GAC"); idx >= 0 {
+		if len(frame) < idx+3+12 {
+			return
+		}
+		arg := frame[idx+3 : idx+3+12]
+		yaw, err1 := HexToAngle(arg[0:4])
+		pitch, err2 := HexToAngle(arg[4:8])
+		roll, err3 := HexToAngle(arg[8:12])
+		if err1 != nil || err2 != nil || err3 != nil {
+			return
+		}
+		c.attMu.Lock()
+		c.attYaw, c.attPitch, c.attRoll = yaw, pitch, roll
+		c.attAt, c.attValid = time.Now(), true
+		c.attMu.Unlock()
+		c.logger.Debug("skydroid attitude", "yaw", yaw, "pitch", pitch, "roll", roll)
 		return
 	}
-	arg := frame[idx+3 : idx+3+12]
-	yaw, err1 := HexToAngle(arg[0:4])
-	pitch, err2 := HexToAngle(arg[4:8])
-	roll, err3 := HexToAngle(arg[8:12])
-	if err1 != nil || err2 != nil || err3 != nil {
+	// VER 查询应答帧（含 "VER" 且非 GAC）：交给挂起的 UDP 查询 waiter。
+	if strings.Contains(frame, "VER") {
+		c.deliverQueryResponse(frame)
+	}
+}
+
+// deliverQueryResponse 把查询应答帧投递给挂起的 waiter（无 waiter 时丢弃，
+// 不影响 readLoop）。非阻塞投递，缓冲为 1，重复帧自动丢弃。
+func (c *Client) deliverQueryResponse(frame string) {
+	c.queryMu.Lock()
+	ch := c.queryWaiter
+	c.queryMu.Unlock()
+	if ch == nil {
 		return
 	}
-	c.attMu.Lock()
-	c.attYaw, c.attPitch, c.attRoll = yaw, pitch, roll
-	c.attAt, c.attValid = time.Now(), true
-	c.attMu.Unlock()
-	c.logger.Debug("skydroid attitude", "yaw", yaw, "pitch", pitch, "roll", roll)
+	select {
+	case ch <- frame:
+	default:
+	}
 }
 
 // Attitude 返回最近一次云台上报的姿态；fresh 表示数据在 maxAge 内。
@@ -192,6 +225,30 @@ func Checksum(cmd string) string {
 
 // Frame 为命令追加校验，返回完整帧。
 func Frame(cmd string) string { return cmd + Checksum(cmd) }
+
+// ParseVERResponse 解析 VER 查询应答帧，提取固件版本号（非应答帧返回空串）。
+// 应答形如 "#tpDU3rVER01<版本数据><校验2>"："VER" 后 2 位为状态位（实测 "01"），
+// 其后即版本数据。
+//
+// 校验实测结论（issue #3 真机应答原文 "#tpDU3rVER01050860"）：末 2 位 "60" 恰好
+// 等于去掉末 2 位后整帧（含 '#'）全部 ASCII 字节的累加校验
+// （Checksum("#tpDU3rVER010508") == "60"），与 GAC 姿态上报帧一样带 2 位尾校验。
+// 因此末 2 位校验吻合时校验并剥离后再取版本号——真机应答的版本数据实为 "0508"
+// （固件 05.08，把校验位 "60" 读成 "050860"/05.08.60 属于误读）；个别固件若不带
+// 校验（末 2 位与累加校验不吻合）则不剥离，保留全串。
+func ParseVERResponse(resp string) string {
+	resp = strings.TrimSpace(resp)
+	idx := strings.Index(resp, "VER")
+	if idx < 0 || len(resp) < idx+5 { // "VER" + 2 位状态位
+		return ""
+	}
+	body := resp[idx+5:]
+	// 末 2 位与整帧累加校验吻合 → 是校验位，剥离。
+	if len(body) > 2 && strings.EqualFold(Checksum(resp[:len(resp)-2]), resp[len(resp)-2:]) {
+		body = body[:len(body)-2]
+	}
+	return body
+}
 
 // Send 发送控制命令（自动追加校验）：
 // UDP 通道无 ACK，按固定次数重发；TCP 通道单次发送（多数控制命令无响应，
@@ -246,6 +303,62 @@ func (c *Client) QueryTCP(cmd string, timeout time.Duration) (string, error) {
 	resp := string(buf[:n])
 	c.logger.Debug("skydroid tcp recv", "resp", resp)
 	return resp, nil
+}
+
+// beginUDPQuery 注册 UDP 查询 waiter，返回应答通道；同一时刻只允许一个挂起查询。
+func (c *Client) beginUDPQuery() (chan string, error) {
+	c.queryMu.Lock()
+	defer c.queryMu.Unlock()
+	if c.queryWaiter != nil {
+		return nil, fmt.Errorf("udp query already pending")
+	}
+	ch := make(chan string, 1)
+	c.queryWaiter = ch
+	return ch, nil
+}
+
+// endUDPQuery 注销挂起的 waiter。
+func (c *Client) endUDPQuery() {
+	c.queryMu.Lock()
+	c.queryWaiter = nil
+	c.queryMu.Unlock()
+}
+
+// QueryUDP 经 UDP 发送查询命令（自动追加校验）并等待应答，适用于 UDP-only 机型
+// 的读类命令（如 VER 固件版本查询，issue #3）。应答不单独开读 socket，而是由
+// readLoop 统一接收、handleFrame 识别后投递给本方法挂起的 waiter。
+// timeout 覆盖全部发送尝试并按尝试次数均分：每次等待超时即重发一次以应对 UDP
+// 丢包，共 udpRetries 次尝试（默认 3 次，即重发 2 次）。
+func (c *Client) QueryUDP(cmd string, timeout time.Duration) (string, error) {
+	if c.udpConn == nil {
+		return "", fmt.Errorf("udp query unavailable: transport=%s", c.transport)
+	}
+	ch, err := c.beginUDPQuery()
+	if err != nil {
+		return "", err
+	}
+	defer c.endUDPQuery()
+
+	frame := Frame(cmd)
+	attempts := c.udpRetries
+	if attempts < 1 {
+		attempts = 1
+	}
+	wait := timeout / time.Duration(attempts)
+	for i := 0; i < attempts; i++ {
+		if _, err := c.udpConn.Write([]byte(frame)); err != nil {
+			return "", fmt.Errorf("udp send %q: %w", frame, err)
+		}
+		c.logger.Debug("skydroid udp sent", "frame", frame, "attempt", i+1)
+		select {
+		case resp := <-ch:
+			c.logger.Debug("skydroid udp recv", "resp", resp)
+			return resp, nil
+		case <-time.After(wait):
+			// 本次尝试未等到应答，继续重发。
+		}
+	}
+	return "", fmt.Errorf("udp query %q: no response within %v", cmd, timeout)
 }
 
 // AngleToHex 把角度编码为协议的十六进制文本（SDK String2ByteArrayUtils.short2Hex

@@ -212,16 +212,31 @@ func runProbe(client *skydroid.Client, cameraIP string) {
 	fmt.Println("提示：连上相机 RTSP（rtsp://" + cameraIP + ":554/stream=0）可验证视频链路。")
 }
 
-// queryFirmware 启动时查询固件版本（失败不阻塞启动）。
+// queryFirmware 启动时查询固件版本（失败不阻塞启动）：
+// 优先 TCP（C20 相机 8100）；TCP 不通（UDP-only 机型仅开放 5000/UDP，issue #3）
+// 时回退 UDP 查询（真机实测可通）；两层都失败才回落 "unknown"。
 func queryFirmware(client *skydroid.Client, logger *slog.Logger) string {
 	resp, err := client.QueryTCP(skydroid.CmdGetVersion, 2*time.Second)
+	udpFallback := false
+	if err != nil {
+		logger.Info("firmware query over tcp failed, fallback to udp", "err", err.Error())
+		resp, err = client.QueryUDP(skydroid.CmdGetVersion, 2*time.Second)
+		udpFallback = err == nil
+	}
 	if err != nil {
 		logger.Warn("query camera firmware failed, using unknown", "err", err.Error())
 		return "unknown"
 	}
-	fw := strings.TrimSpace(resp)
-	fw = strings.TrimPrefix(fw, skydroid.CmdGetVersion)
-	fw = strings.TrimPrefix(fw, "=")
+	var fw string
+	if udpFallback {
+		// UDP 应答帧形如 #tpDU3rVER01<版本><校验>：剥离校验取版本号
+		// （校验规则见 skydroid.ParseVERResponse 注释）。
+		fw = skydroid.ParseVERResponse(resp)
+	} else {
+		fw = strings.TrimSpace(resp)
+		fw = strings.TrimPrefix(fw, skydroid.CmdGetVersion)
+		fw = strings.TrimPrefix(fw, "=")
+	}
 	if fw == "" {
 		fw = "unknown"
 	}
